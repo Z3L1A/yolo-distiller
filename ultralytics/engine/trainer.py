@@ -624,6 +624,8 @@ class BaseTrainer:
         # make loss
         if self.teacher is not None:
             distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
+            # Move FeatureLoss (align_module, etc.) to training device
+            distillation_loss.distill_loss_fn = distillation_loss.distill_loss_fn.to(self.device)
             # Add FeatureLoss learnable params (align_module) to optimizer
             distill_params = list(distillation_loss.distill_loss_fn.parameters())
             if distill_params:
