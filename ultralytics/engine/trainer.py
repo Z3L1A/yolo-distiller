@@ -57,7 +57,7 @@ from ultralytics.utils.torch_utils import (
 
 class CWDLoss(nn.Module):
     """PyTorch version of `Channel-wise Distillation for Semantic Segmentation.
-    <https://arxiv.org/abs/2011.13256>`_.
+    <https://arxiv.org/abs/2011.13256>`_. The loss is calculated as the KL divergence between the student and teacher feature maps, normalized by the number of channels and batch size. The temperature parameter `tau` is used to soften the probability distributions, which can help improve the distillation process.
     """
 
     def __init__(self, channels_s, channels_t, tau=1.0):
