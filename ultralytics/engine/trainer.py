@@ -103,14 +103,13 @@ class MGDLoss(nn.Module):
         super(MGDLoss, self).__init__()
         self.alpha_mgd = alpha_mgd
         self.lambda_mgd = lambda_mgd
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         self.generation = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(channel, channel, kernel_size=3, padding=1),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(channel, channel, kernel_size=3, padding=1)
-            ).to(device) for channel in teacher_channels
+            ) for channel in teacher_channels
         ])
 
     def forward(self, y_s, y_t, layer=None):
@@ -155,33 +154,20 @@ class FeatureLoss(nn.Module):
         self.loss_weight = loss_weight
         self.distiller = distiller
         
-        # Move all modules to same precision
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
-        # Convert to ModuleList and ensure consistent dtype
+        # Channel alignment: student → teacher dims (no .to(device) — inherits from parent)
         self.align_module = nn.ModuleList()
-        self.norm = nn.ModuleList()
-        self.norm1 = nn.ModuleList()
-        
-        # Create alignment modules
         for s_chan, t_chan in zip(channels_s, channels_t):
             align = nn.Sequential(
                 nn.Conv2d(s_chan, t_chan, kernel_size=1, stride=1, padding=0),
                 nn.BatchNorm2d(t_chan, affine=False)
-            ).to(device)
+            )
             self.align_module.append(align)
-            
-        # Create normalization layers
-        for t_chan in channels_t:
-            self.norm.append(nn.BatchNorm2d(t_chan, affine=False).to(device))
-            
-        for s_chan in channels_s:
-            self.norm1.append(nn.BatchNorm2d(s_chan, affine=False).to(device))
 
         if distiller == 'mgd':
-            self.feature_loss = MGDLoss(channels_s, channels_t)
+            # After alignment, student features have teacher_channels dims
+            self.feature_loss = MGDLoss(channels_t, channels_t)
         elif distiller == 'cwd':
-            self.feature_loss = CWDLoss(channels_s, channels_t)
+            self.feature_loss = CWDLoss(channels_t, channels_t)
         else:
             raise NotImplementedError
 
@@ -197,16 +183,10 @@ class FeatureLoss(nn.Module):
             s = s.type(next(self.align_module[idx].parameters()).dtype)
             t = t.type(next(self.align_module[idx].parameters()).dtype)
             
-            if self.distiller == "cwd":
-                # Apply alignment and normalization
-                s = self.align_module[idx](s)
-                stu_feats.append(s)
-                tea_feats.append(t.detach())
-            else:
-                # Apply normalization
-                t = self.norm1[idx](t)
-                stu_feats.append(s)
-                tea_feats.append(t.detach())
+            # Always align student channels to teacher dimensions
+            s = self.align_module[idx](s)
+            stu_feats.append(s)
+            tea_feats.append(t.detach())
 
         loss = self.feature_loss(stu_feats, tea_feats)
         return self.loss_weight * loss
@@ -317,9 +297,6 @@ class DistillationLoss:
             return torch.tensor(0.0, requires_grad=True)
         
         quant_loss = self.distill_loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs)
-        
-        if self.distiller != 'cwd':
-            quant_loss *= 0.3
 
         self.teacher_outputs.clear()
         self.student_outputs.clear()
@@ -526,8 +503,9 @@ class BaseTrainer:
         # Load teacher model to device
         if self.teacher is not None:
             for k, v in self.teacher.named_parameters():
-                v.requires_grad = True
+                v.requires_grad = False  # Teacher must be frozen
             self.teacher = self.teacher.to(self.device)
+            self.teacher.eval()  # Teacher always in eval mode
                 
         self.set_model_attributes()
 
@@ -570,7 +548,6 @@ class BaseTrainer:
             
             if self.teacher is not None:
                 self.teacher = nn.parallel.DistributedDataParallel(self.teacher, device_ids=[RANK])
-                temp = self.teacher.eval()
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
@@ -647,6 +624,14 @@ class BaseTrainer:
         # make loss
         if self.teacher is not None:
             distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
+            # Add FeatureLoss learnable params (align_module) to optimizer
+            distill_params = list(distillation_loss.distill_loss_fn.parameters())
+            if distill_params:
+                self.optimizer.add_param_group({
+                    "params": distill_params,
+                    "weight_decay": 0.0,
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                })
         
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
@@ -701,12 +686,11 @@ class BaseTrainer:
                     
                 # Add more distillation logic
                 if self.teacher is not None:
-                    distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
                     with torch.no_grad():
                         pred = self.teacher(batch['img'])
                         
                     self.d_loss = distillation_loss.get_loss()
-                    self.d_loss *- distill_weight
+                    self.d_loss *= self.args.distill_weight
                     self.loss += self.d_loss
 
                 # Backward
@@ -1119,15 +1103,8 @@ class BaseTrainer:
                     g[1].append(param)
                 else:  # weight (with decay)
                     g[0].append(param)
-                    
-        if teacher is not None:
-            for v in teacher.modules():
-                if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
-                    g[2].append(v.bias)
-                if isinstance(v, bn):  # weight (no decay)
-                    g[1].append(v.weight)
-                elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
-                    g[0].append(v.weight)
+
+        # Note: teacher params are NOT added to optimizer — teacher must stay frozen
 
         if name in {"Adam", "Adamax", "AdamW", "NAdam", "RAdam"}:
             optimizer = getattr(optim, name, optim.Adam)(g[2], lr=lr, betas=(momentum, 0.999), weight_decay=0.0)

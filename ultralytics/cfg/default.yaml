@@ -88,6 +88,7 @@ nms: False # (bool) CoreML: add NMS
 
 teacher: None
 distillation_loss: None
+distill_weight: 1.0 # (float) distillation loss weight multiplier
 
 # Hyperparameters ------------------------------------------------------------------------------------------------------
 lr0: 0.01 # (float) initial learning rate (i.e. SGD=1E-2, Adam=1E-3)
