@@ -627,10 +627,12 @@ class BaseTrainer:
             # Add FeatureLoss learnable params (align_module) to optimizer
             distill_params = list(distillation_loss.distill_loss_fn.parameters())
             if distill_params:
+                init_lr = self.optimizer.param_groups[0]["lr"]
                 self.optimizer.add_param_group({
                     "params": distill_params,
                     "weight_decay": 0.0,
-                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "lr": init_lr,
+                    "initial_lr": init_lr,
                 })
         
         epoch = self.start_epoch
