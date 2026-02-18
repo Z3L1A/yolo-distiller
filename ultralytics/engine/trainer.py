@@ -677,6 +677,13 @@ class BaseTrainer:
                         )
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
+                else:
+                    # After warmup: sync distill param group LR with scheduler
+                    n_pg = len(self.optimizer.param_groups)
+                    if n_pg > 3:  # distill param group exists
+                        self.optimizer.param_groups[-1]["lr"] = (
+                            self.optimizer.param_groups[-1]["initial_lr"] * self.lf(epoch)
+                        )
 
                 # Forward
                 with autocast(self.amp):
@@ -688,14 +695,22 @@ class BaseTrainer:
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
                     
-                # Add more distillation logic
-                if self.teacher is not None:
+                # Distillation logic — skip during warmup
+                if self.teacher is not None and ni > nw:
                     with torch.no_grad():
                         pred = self.teacher(batch['img'])
                         
                     self.d_loss = distillation_loss.get_loss()
-                    self.d_loss *= self.args.distill_weight
+                    # Gradual distill warmup over distill_warmup_iters after main warmup ends
+                    distill_warmup_iters = nb * self.args.distill_warmup_epochs
+                    distill_progress = min(1.0, (ni - nw) / distill_warmup_iters)
+                    self.d_loss *= self.args.distill_weight * distill_progress
                     self.loss += self.d_loss
+                elif self.teacher is not None and ni <= nw:
+                    # During warmup: run teacher forward to fill hooks, but discard loss
+                    with torch.no_grad():
+                        pred = self.teacher(batch['img'])
+                    distillation_loss.get_loss()  # clear hook buffers
 
                 # Backward
                 self.scaler.scale(self.loss).backward()
