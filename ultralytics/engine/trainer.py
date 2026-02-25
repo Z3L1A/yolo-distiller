@@ -659,6 +659,7 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+            self.td_loss = None  # running average of distillation loss per epoch
             
             if self.teacher is not None:
                 distillation_loss.register_hook()
@@ -706,6 +707,11 @@ class BaseTrainer:
                     distill_progress = min(1.0, (ni - nw) / distill_warmup_iters)
                     self.d_loss *= self.args.distill_weight * distill_progress
                     self.loss += self.d_loss
+                    # Track running average of distillation loss
+                    d_loss_val = self.d_loss.detach()
+                    self.td_loss = (
+                        (self.td_loss * i + d_loss_val) / (i + 1) if self.td_loss is not None else d_loss_val
+                    )
                 elif self.teacher is not None and ni <= nw:
                     # During warmup: run teacher forward to fill hooks, but discard loss
                     with torch.no_grad():
@@ -762,7 +768,8 @@ class BaseTrainer:
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
-                self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+                distill_metrics = {"train/distill_loss": round(float(self.td_loss), 5)} if self.td_loss is not None else {}
+                self.save_metrics(metrics={**self.label_loss_items(self.tloss), **distill_metrics, **self.metrics, **self.lr})
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
