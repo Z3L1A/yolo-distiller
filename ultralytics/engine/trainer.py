@@ -768,7 +768,7 @@ class BaseTrainer:
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
-                distill_metrics = {"train/distill_loss": round(float(self.td_loss), 5)} if self.td_loss is not None else {}
+                distill_metrics = {"train/distill_loss": round(float(self.td_loss), 5) if self.td_loss is not None else 0.0} if self.teacher is not None else {}
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **distill_metrics, **self.metrics, **self.lr})
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
