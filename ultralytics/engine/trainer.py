@@ -7,6 +7,7 @@ Usage:
 """
 
 import gc
+import csv
 import math
 import os
 import subprocess
@@ -839,8 +840,14 @@ class BaseTrainer:
     def read_results_csv(self):
         """Read results.csv into a dict using pandas."""
         import pandas as pd  # scope for faster 'import ultralytics'
-
-        return pd.read_csv(self.csv).to_dict(orient="list")
+        try:
+            return pd.read_csv(self.csv).to_dict(orient="list")
+        except pd.errors.ParserError:
+            LOGGER.warning(
+                f"WARNING ⚠️ Failed to parse {self.csv.name} due to malformed rows. "
+                "Retrying with tolerant parser and skipping bad lines."
+            )
+            return pd.read_csv(self.csv, engine="python", on_bad_lines="skip").to_dict(orient="list")
 
     def save_model(self):
         """Save model training checkpoints with additional metadata."""
@@ -990,11 +997,52 @@ class BaseTrainer:
     def save_metrics(self, metrics):
         """Saves training metrics to a CSV file."""
         keys, vals = list(metrics.keys()), list(metrics.values())
-        n = len(metrics) + 2  # number of cols
-        s = "" if self.csv.exists() else (("%s," * n % tuple(["epoch", "time"] + keys)).rstrip(",") + "\n")  # header
         t = time.time() - self.train_time_start
-        with open(self.csv, "a") as f:
-            f.write(s + ("%.6g," * n % tuple([self.epoch + 1, t] + vals)).rstrip(",") + "\n")
+        row_values = [self.epoch + 1, t] + vals
+        row_keys = ["epoch", "time", *keys]
+
+        def _fmt(value):
+            try:
+                return f"{float(value):.6g}"
+            except (TypeError, ValueError):
+                return str(value)
+
+        row = {k: _fmt(v) for k, v in zip(row_keys, row_values)}
+
+        # Keep CSV schema consistent across resumed runs (e.g. distillation adds new metric columns).
+        if self.csv.exists() and self.csv.stat().st_size > 0:
+            with open(self.csv, newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, [])
+
+            if header:
+                missing = [k for k in row_keys if k not in header]
+                if missing:
+                    merged_header = header + missing
+                    with open(self.csv, newline="") as f:
+                        old_rows = list(csv.DictReader(f))
+                    with open(self.csv, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=merged_header)
+                        writer.writeheader()
+                        writer.writerows(old_rows)
+                        writer.writerow({k: row.get(k, "") for k in merged_header})
+                    LOGGER.warning(
+                        f"WARNING ⚠️ Expanded {self.csv.name} columns to match current metrics: "
+                        f"{', '.join(missing)}"
+                    )
+                    return
+
+                # Existing schema already contains all keys (order may differ), append in header order.
+                with open(self.csv, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([row.get(k, "") for k in header])
+                return
+
+        with open(self.csv, "a", newline="") as f:
+            writer = csv.writer(f)
+            if f.tell() == 0:
+                writer.writerow(row_keys)
+            writer.writerow([row[k] for k in row_keys])
 
     def plot_metrics(self):
         """Plot and display metrics visually."""
