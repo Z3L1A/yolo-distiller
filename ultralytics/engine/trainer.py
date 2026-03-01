@@ -637,6 +637,14 @@ class BaseTrainer:
                     "lr": init_lr,
                     "initial_lr": init_lr,
                 })
+            # Now that distill param groups match, load the deferred optimizer state
+            if hasattr(self, "_deferred_optimizer_state"):
+                try:
+                    self.optimizer.load_state_dict(self._deferred_optimizer_state)
+                    LOGGER.info("✅ Deferred optimizer state restored successfully after distillation params were added.")
+                except Exception as e:
+                    LOGGER.warning(f"⚠️ Could not restore deferred optimizer state: {e}")
+                del self._deferred_optimizer_state
         
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
@@ -1108,7 +1116,18 @@ class BaseTrainer:
         best_fitness = 0.0
         start_epoch = ckpt.get("epoch", -1) + 1
         if ckpt.get("optimizer", None) is not None:
-            self.optimizer.load_state_dict(ckpt["optimizer"])  # optimizer
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer"])  # optimizer
+            except ValueError as e:
+                # Param group count mismatch can happen when resuming distillation training:
+                # the checkpoint optimizer has an extra group for distillation (FeatureLoss) params
+                # that haven't been added yet at this point. Store the state dict and defer loading
+                # until distillation params are re-added in _do_train.
+                LOGGER.warning(
+                    f"⚠️ Optimizer state dict mismatch ({e}), deferring optimizer state restore "
+                    f"until distillation param groups are rebuilt."
+                )
+                self._deferred_optimizer_state = ckpt["optimizer"]
             best_fitness = ckpt["best_fitness"]
         if self.ema and ckpt.get("ema"):
             self.ema.ema.load_state_dict(ckpt["ema"].float().state_dict())  # EMA
