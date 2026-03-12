@@ -309,6 +309,163 @@ class DistillationLoss:
             rm.remove()
         self.remove_handle.clear()
 
+
+class LogitDistillationLoss:
+    """Logit-level knowledge distillation for YOLO detection models.
+
+    Distills knowledge from the teacher's detection head outputs (class logits and bbox
+    DFL distributions) directly to the student. Uses objectness-weighted loss to focus
+    on foreground predictions from the teacher.
+
+    Unlike feature-level distillation (CWD/MGD), this approach:
+    - Requires no learnable alignment modules (no extra optimizer params)
+    - Operates on task-aligned signals (detection outputs, not abstract features)
+    - Naturally handles different backbone widths (detection head output format
+      is identical across model scales: nc + reg_max*4 channels)
+    """
+
+    def __init__(self, models, modelt, tau=2.0):
+        """Initialize logit-level distillation.
+
+        Args:
+            models: Student model (may be DDP-wrapped).
+            modelt: Teacher model (may be DDP-wrapped).
+            tau: Temperature for softening distributions. Higher = softer.
+        """
+        self.remove_handle = []
+
+        # Get Detect modules (unwrap DDP if needed)
+        s_model = models.module if hasattr(models, 'module') else models
+        t_model = modelt.module if hasattr(modelt, 'module') else modelt
+        self.student_detect = s_model.model[-1]
+        self.teacher_detect = t_model.model[-1]
+
+        self.nc = self.student_detect.nc
+        self.reg_max = self.student_detect.reg_max
+        self.no = self.nc + self.reg_max * 4
+        self.tau = tau
+
+        # Verify compatibility
+        assert self.nc == self.teacher_detect.nc, \
+            f"Student nc={self.nc} != Teacher nc={self.teacher_detect.nc}"
+        assert self.reg_max == self.teacher_detect.reg_max, \
+            f"Student reg_max={self.reg_max} != Teacher reg_max={self.teacher_detect.reg_max}"
+
+        self.student_outputs = []
+        self.teacher_outputs = []
+
+    def register_hook(self):
+        """Register forward hooks on student and teacher Detect modules."""
+        self.remove_handle_()
+        self.student_outputs = []
+        self.teacher_outputs = []
+
+        def make_student_hook(storage):
+            def hook(m, inp, out):
+                if isinstance(out, list):
+                    # Training mode: Detect returns list of [B, no, H, W]
+                    storage.extend(out)
+                elif isinstance(out, tuple) and len(out) == 2:
+                    # Eval mode: Detect returns (y, x)
+                    raw = out[1]
+                    if isinstance(raw, list):
+                        storage.extend(raw)
+            return hook
+
+        def make_teacher_hook(storage):
+            def hook(m, inp, out):
+                if isinstance(out, tuple) and len(out) == 2:
+                    raw = out[1]
+                    if isinstance(raw, list):
+                        storage.extend([o.detach() for o in raw])
+                elif isinstance(out, list):
+                    storage.extend([o.detach() for o in out])
+            return hook
+
+        self.remove_handle.append(
+            self.student_detect.register_forward_hook(make_student_hook(self.student_outputs))
+        )
+        self.remove_handle.append(
+            self.teacher_detect.register_forward_hook(make_teacher_hook(self.teacher_outputs))
+        )
+
+    def get_loss(self):
+        """Compute logit distillation loss from captured head outputs.
+
+        Returns:
+            torch.Tensor: Scalar distillation loss (with gradient for student path).
+        """
+        if not self.student_outputs or not self.teacher_outputs:
+            self.student_outputs.clear()
+            self.teacher_outputs.clear()
+            return torch.tensor(0.0, requires_grad=True)
+
+        if len(self.student_outputs) != len(self.teacher_outputs):
+            LOGGER.warning(
+                f"Logit KD: Mismatched outputs - Student: {len(self.student_outputs)}, "
+                f"Teacher: {len(self.teacher_outputs)}"
+            )
+            self.student_outputs.clear()
+            self.teacher_outputs.clear()
+            return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu',
+                                requires_grad=True)
+
+        total_loss = 0.0
+        reg_max = self.reg_max
+        tau = self.tau
+
+        for s, t in zip(self.student_outputs, self.teacher_outputs):
+            B, C, H, W = s.shape
+            N = B * H * W  # total grid cells at this level
+
+            # Reshape: (B, C, H, W) -> (B*H*W, C)
+            s_flat = s.permute(0, 2, 3, 1).reshape(N, C).float()
+            t_flat = t.permute(0, 2, 3, 1).reshape(N, C).float()
+
+            # Split into bbox DFL logits and class logits
+            s_box, s_cls = s_flat[:, :reg_max * 4], s_flat[:, reg_max * 4:]
+            t_box, t_cls = t_flat[:, :reg_max * 4], t_flat[:, reg_max * 4:]
+
+            # === Objectness weighting from teacher ===
+            # Focus distillation on cells where teacher detects objects
+            with torch.no_grad():
+                t_obj = torch.sigmoid(t_cls).max(dim=1)[0]  # max class prob per cell
+                obj_weight = t_obj / (t_obj.sum() + 1e-6)   # soft attention mask
+
+            # === Classification distillation ===
+            # Binary cross-entropy with temperature-scaled teacher soft targets
+            t_cls_soft = torch.sigmoid(t_cls / tau).detach()
+            cls_loss = F.binary_cross_entropy_with_logits(
+                s_cls / tau, t_cls_soft, reduction='none'
+            ).sum(dim=1)  # (N,)
+            cls_loss = (cls_loss * obj_weight).sum() * (tau ** 2)
+
+            # === Bbox DFL distribution distillation ===
+            # KL divergence on softmax DFL distributions
+            s_dfl = s_box.view(N, 4, reg_max)
+            t_dfl = t_box.view(N, 4, reg_max)
+
+            t_dfl_soft = F.softmax(t_dfl / tau, dim=2).detach()
+            s_dfl_log = F.log_softmax(s_dfl / tau, dim=2)
+
+            # KL(teacher || student) per cell
+            dfl_loss = F.kl_div(s_dfl_log, t_dfl_soft, reduction='none').sum(dim=2).sum(dim=1)  # (N,)
+            dfl_loss = (dfl_loss * obj_weight).sum() * (tau ** 2)
+
+            total_loss = total_loss + cls_loss + dfl_loss
+
+        self.student_outputs.clear()
+        self.teacher_outputs.clear()
+
+        return total_loss
+
+    def remove_handle_(self):
+        """Remove all registered hooks."""
+        for h in self.remove_handle:
+            h.remove()
+        self.remove_handle.clear()
+
+
 class BaseTrainer:
     """
     A base class for creating trainers.
@@ -624,26 +781,30 @@ class BaseTrainer:
             
         # make loss
         if self.teacher is not None:
-            distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
-            # Move FeatureLoss (align_module, etc.) to training device
-            distillation_loss.distill_loss_fn = distillation_loss.distill_loss_fn.to(self.device)
-            # Add FeatureLoss learnable params (align_module) to optimizer
-            distill_params = list(distillation_loss.distill_loss_fn.parameters())
-            if distill_params:
-                init_lr = self.optimizer.param_groups[0]["lr"]
-                self.optimizer.add_param_group({
-                    "params": distill_params,
-                    "weight_decay": 0.0,
-                    "lr": init_lr,
-                    "initial_lr": init_lr,
-                })
+            if self.loss_type == 'logit':
+                distillation_loss = LogitDistillationLoss(self.model, self.teacher)
+                LOGGER.info("Using logit-level knowledge distillation (tau=2.0, objectness-weighted)")
+            else:
+                distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
+                # Move FeatureLoss (align_module, etc.) to training device
+                distillation_loss.distill_loss_fn = distillation_loss.distill_loss_fn.to(self.device)
+                # Add FeatureLoss learnable params (align_module) to optimizer
+                distill_params = list(distillation_loss.distill_loss_fn.parameters())
+                if distill_params:
+                    init_lr = self.optimizer.param_groups[0]["lr"]
+                    self.optimizer.add_param_group({
+                        "params": distill_params,
+                        "weight_decay": 0.0,
+                        "lr": init_lr,
+                        "initial_lr": init_lr,
+                    })
             # Now that distill param groups match, load the deferred optimizer state
             if hasattr(self, "_deferred_optimizer_state"):
                 try:
                     self.optimizer.load_state_dict(self._deferred_optimizer_state)
-                    LOGGER.info("✅ Deferred optimizer state restored successfully after distillation params were added.")
+                    LOGGER.info("Deferred optimizer state restored successfully after distillation params were added.")
                 except Exception as e:
-                    LOGGER.warning(f"⚠️ Could not restore deferred optimizer state: {e}")
+                    LOGGER.warning(f"Could not restore deferred optimizer state: {e}")
                 del self._deferred_optimizer_state
         
         epoch = self.start_epoch
@@ -713,7 +874,7 @@ class BaseTrainer:
                     self.d_loss = distillation_loss.get_loss()
                     # Gradual distill warmup over distill_warmup_iters after main warmup ends
                     distill_warmup_iters = nb * self.args.distill_warmup_epochs
-                    distill_progress = min(1.0, (ni - nw) / distill_warmup_iters)
+                    distill_progress = min(1.0, (ni - nw) / distill_warmup_iters) 
                     self.d_loss *= self.args.distill_weight * distill_progress
                     self.loss += self.d_loss
                     # Track running average of distillation loss
