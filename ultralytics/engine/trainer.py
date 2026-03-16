@@ -877,7 +877,10 @@ class BaseTrainer:
                     self.d_loss = distillation_loss.get_loss()
                     # Gradual distill warmup over distill_warmup_iters after main warmup ends
                     distill_warmup_iters = nb * self.args.distill_warmup_epochs
-                    distill_progress = min(1.0, (ni - nw) / distill_warmup_iters) 
+                    if distill_warmup_iters > 0:
+                        distill_progress = min(1.0, (ni - nw) / distill_warmup_iters)
+                    else:
+                        distill_progress = 1.0
                     self.d_loss *= self.args.distill_weight * distill_progress
                     # Ratio before adding distillation term: useful to diagnose KD dominance
                     main_loss_detached = self.loss.detach().abs() + 1e-9
