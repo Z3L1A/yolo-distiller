@@ -398,7 +398,8 @@ class LogitDistillationLoss:
         if not self.student_outputs or not self.teacher_outputs:
             self.student_outputs.clear()
             self.teacher_outputs.clear()
-            return torch.tensor(0.0, requires_grad=True)
+            device = self.student_detect.stride.device
+            return torch.tensor(0.0, device=device, requires_grad=True)
 
         if len(self.student_outputs) != len(self.teacher_outputs):
             LOGGER.warning(
@@ -407,10 +408,11 @@ class LogitDistillationLoss:
             )
             self.student_outputs.clear()
             self.teacher_outputs.clear()
-            return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu',
-                                requires_grad=True)
+            device = self.student_detect.stride.device
+            return torch.tensor(0.0, device=device, requires_grad=True)
 
         total_loss = 0.0
+        n_levels = len(self.student_outputs)
         reg_max = self.reg_max
         tau = self.tau
 
@@ -437,7 +439,7 @@ class LogitDistillationLoss:
             t_cls_soft = torch.sigmoid(t_cls / tau).detach()
             cls_loss = F.binary_cross_entropy_with_logits(
                 s_cls / tau, t_cls_soft, reduction='none'
-            ).sum(dim=1)  # (N,)
+            ).mean(dim=1)  # (N,) normalize by number of classes
             cls_loss = (cls_loss * obj_weight).sum() * (tau ** 2)
 
             # === Bbox DFL distribution distillation ===
@@ -449,7 +451,7 @@ class LogitDistillationLoss:
             s_dfl_log = F.log_softmax(s_dfl / tau, dim=2)
 
             # KL(teacher || student) per cell
-            dfl_loss = F.kl_div(s_dfl_log, t_dfl_soft, reduction='none').sum(dim=2).sum(dim=1)  # (N,)
+            dfl_loss = F.kl_div(s_dfl_log, t_dfl_soft, reduction='none').mean(dim=2).mean(dim=1)  # (N,)
             dfl_loss = (dfl_loss * obj_weight).sum() * (tau ** 2)
 
             total_loss = total_loss + cls_loss + dfl_loss
@@ -457,7 +459,7 @@ class LogitDistillationLoss:
         self.student_outputs.clear()
         self.teacher_outputs.clear()
 
-        return total_loss
+        return total_loss / max(n_levels, 1)
 
     def remove_handle_(self):
         """Remove all registered hooks."""
@@ -830,6 +832,7 @@ class BaseTrainer:
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
             self.td_loss = None  # running average of distillation loss per epoch
+            self.td_ratio = None  # running average of distill/main loss ratio per epoch
             
             if self.teacher is not None:
                 distillation_loss.register_hook()
@@ -876,11 +879,17 @@ class BaseTrainer:
                     distill_warmup_iters = nb * self.args.distill_warmup_epochs
                     distill_progress = min(1.0, (ni - nw) / distill_warmup_iters) 
                     self.d_loss *= self.args.distill_weight * distill_progress
+                    # Ratio before adding distillation term: useful to diagnose KD dominance
+                    main_loss_detached = self.loss.detach().abs() + 1e-9
+                    d_ratio_val = (self.d_loss.detach().abs() / main_loss_detached)
                     self.loss += self.d_loss
                     # Track running average of distillation loss
                     d_loss_val = self.d_loss.detach()
                     self.td_loss = (
                         (self.td_loss * i + d_loss_val) / (i + 1) if self.td_loss is not None else d_loss_val
+                    )
+                    self.td_ratio = (
+                        (self.td_ratio * i + d_ratio_val) / (i + 1) if self.td_ratio is not None else d_ratio_val
                     )
                 elif self.teacher is not None and ni <= nw:
                     # During warmup: run teacher forward to fill hooks, but discard loss
@@ -938,7 +947,10 @@ class BaseTrainer:
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
-                distill_metrics = {"train/distill_loss": round(float(self.td_loss), 5) if self.td_loss is not None else 0.0} if self.teacher is not None else {}
+                distill_metrics = {
+                    "train/distill_loss": round(float(self.td_loss), 5) if self.td_loss is not None else 0.0,
+                    "train/distill_ratio": round(float(self.td_ratio), 5) if self.td_ratio is not None else 0.0,
+                } if self.teacher is not None else {}
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **distill_metrics, **self.metrics, **self.lr})
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
