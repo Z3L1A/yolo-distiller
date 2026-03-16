@@ -882,9 +882,10 @@ class BaseTrainer:
                     else:
                         distill_progress = 1.0
                     self.d_loss *= self.args.distill_weight * distill_progress
-                    # Ratio before adding distillation term: useful to diagnose KD dominance
-                    main_loss_detached = self.loss.detach().abs() + 1e-9
-                    d_ratio_val = (self.d_loss.detach().abs() / main_loss_detached)
+                    # Ratio in the same scale as logged train losses (box+cls+dfl in results.csv)
+                    # self.loss is batch-size scaled in Ultralytics; self.loss_items are per-component logged values.
+                    main_loss_logged_scale = self.loss_items.detach().sum().abs() + 1e-9
+                    d_ratio_val = self.d_loss.detach().abs() / main_loss_logged_scale
                     self.loss += self.d_loss
                     # Track running average of distillation loss
                     d_loss_val = self.d_loss.detach()
