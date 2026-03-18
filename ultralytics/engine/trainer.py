@@ -311,11 +311,12 @@ class DistillationLoss:
 
 
 class LogitDistillationLoss:
-    """Logit-level knowledge distillation for YOLO detection models.
+    """GT-guided logit-level knowledge distillation for YOLO detection models.
 
     Distills knowledge from the teacher's detection head outputs (class logits and bbox
-    DFL distributions) directly to the student. Uses objectness-weighted loss to focus
-    on foreground predictions from the teacher.
+    DFL distributions) directly to the student. Uses fg_mask from TAL (Task-Aligned
+    Assigner) to distill ONLY on foreground positions assigned to ground-truth objects,
+    avoiding noise from background positions.
 
     Unlike feature-level distillation (CWD/MGD), this approach:
     - Requires no learnable alignment modules (no extra optimizer params)
@@ -337,6 +338,7 @@ class LogitDistillationLoss:
         # Get Detect modules (unwrap DDP if needed)
         s_model = models.module if hasattr(models, 'module') else models
         t_model = modelt.module if hasattr(modelt, 'module') else modelt
+        self.s_model = s_model  # reference for accessing criterion.last_fg_mask
         self.student_detect = s_model.model[-1]
         self.teacher_detect = t_model.model[-1]
 
@@ -390,7 +392,11 @@ class LogitDistillationLoss:
         )
 
     def get_loss(self):
-        """Compute logit distillation loss from captured head outputs.
+        """Compute GT-guided logit distillation loss from captured head outputs.
+
+        Uses fg_mask from TAL assignment to distill ONLY on foreground (positive)
+        anchor positions. This avoids the noise from background positions where
+        teacher predictions are unreliable and conflict with ground truth targets.
 
         Returns:
             torch.Tensor: Scalar distillation loss (with gradient for student path).
@@ -411,12 +417,22 @@ class LogitDistillationLoss:
             device = self.student_detect.stride.device
             return torch.tensor(0.0, device=device, requires_grad=True)
 
-        total_loss = 0.0
+        device = self.student_detect.stride.device
+        total_loss = torch.tensor(0.0, device=device, requires_grad=False)
         n_levels = len(self.student_outputs)
         reg_max = self.reg_max
         tau = self.tau
 
-        for s, t in zip(self.student_outputs, self.teacher_outputs):
+        # --- Get fg_mask from TAL (computed during main loss) ---
+        fg_masks_per_level = None
+        criterion = getattr(self.s_model, 'criterion', None)
+        if criterion is not None and hasattr(criterion, 'last_fg_mask'):
+            fg_mask = criterion.last_fg_mask  # (B, total_anchors) bool
+            level_sizes = criterion.last_anchor_splits  # [H1*W1, H2*W2, H3*W3]
+            if len(level_sizes) == n_levels:
+                fg_masks_per_level = fg_mask.split(level_sizes, dim=1)  # list of (B, Hi*Wi)
+
+        for idx, (s, t) in enumerate(zip(self.student_outputs, self.teacher_outputs)):
             B, C, H, W = s.shape
             N = B * H * W  # total grid cells at this level
 
@@ -424,35 +440,38 @@ class LogitDistillationLoss:
             s_flat = s.permute(0, 2, 3, 1).reshape(N, C).float()
             t_flat = t.permute(0, 2, 3, 1).reshape(N, C).float()
 
+            # --- Apply GT-guided mask (only distill on foreground positions) ---
+            if fg_masks_per_level is not None:
+                level_mask = fg_masks_per_level[idx].reshape(N)  # (B*H*W,)
+                n_pos = level_mask.sum().item()
+                if n_pos == 0:
+                    continue  # no positive anchors at this level
+                s_flat = s_flat[level_mask]  # (n_pos, C)
+                t_flat = t_flat[level_mask]  # (n_pos, C)
+
             # Split into bbox DFL logits and class logits
             s_box, s_cls = s_flat[:, :reg_max * 4], s_flat[:, reg_max * 4:]
             t_box, t_cls = t_flat[:, :reg_max * 4], t_flat[:, reg_max * 4:]
 
-            # === Objectness weighting from teacher ===
-            # Focus distillation on cells where teacher detects objects
-            with torch.no_grad():
-                t_obj = torch.sigmoid(t_cls).max(dim=1)[0]  # max class prob per cell
-                obj_weight = t_obj / (t_obj.sum() + 1e-6)   # soft attention mask
-
             # === Classification distillation ===
-            # Binary cross-entropy with temperature-scaled teacher soft targets
+            # Mean over selected (foreground) positions
             t_cls_soft = torch.sigmoid(t_cls / tau).detach()
             cls_loss = F.binary_cross_entropy_with_logits(
                 s_cls / tau, t_cls_soft, reduction='none'
-            ).mean(dim=1)  # (N,) normalize by number of classes
-            cls_loss = (cls_loss * obj_weight).sum() * (tau ** 2)
+            ).mean(dim=1)  # (n_pos,)
+            cls_loss = cls_loss.mean() * (tau ** 2)
 
             # === Bbox DFL distribution distillation ===
-            # KL divergence on softmax DFL distributions
-            s_dfl = s_box.view(N, 4, reg_max)
-            t_dfl = t_box.view(N, 4, reg_max)
+            n_pos_actual = s_flat.shape[0]
+            s_dfl = s_box.view(n_pos_actual, 4, reg_max)
+            t_dfl = t_box.view(n_pos_actual, 4, reg_max)
 
             t_dfl_soft = F.softmax(t_dfl / tau, dim=2).detach()
             s_dfl_log = F.log_softmax(s_dfl / tau, dim=2)
 
-            # KL(teacher || student) per cell
-            dfl_loss = F.kl_div(s_dfl_log, t_dfl_soft, reduction='none').mean(dim=2).mean(dim=1)  # (N,)
-            dfl_loss = (dfl_loss * obj_weight).sum() * (tau ** 2)
+            # KL(teacher || student) per position
+            dfl_loss = F.kl_div(s_dfl_log, t_dfl_soft, reduction='none').mean(dim=2).mean(dim=1)  # (n_pos,)
+            dfl_loss = dfl_loss.mean() * (tau ** 2)
 
             total_loss = total_loss + cls_loss + dfl_loss
 
@@ -882,15 +901,18 @@ class BaseTrainer:
                     else:
                         distill_progress = 1.0
                     self.d_loss *= self.args.distill_weight * distill_progress
-                    # Ratio in the same scale as logged train losses (box+cls+dfl in results.csv)
-                    # self.loss is batch-size scaled in Ultralytics; self.loss_items are per-component logged values.
+                    # Batch-scale d_loss to match self.loss convention:
+                    # v8DetectionLoss returns loss.sum() * batch_size, so d_loss must also be batch-scaled.
+                    batch_size = batch['img'].shape[0]
+                    self.d_loss = self.d_loss * batch_size
+                    # Ratio: compare per-item scales (d_loss/batch_size vs loss_items.sum())
                     main_loss_logged_scale = self.loss_items.detach().sum().abs() + 1e-9
-                    d_ratio_val = self.d_loss.detach().abs() / main_loss_logged_scale
+                    d_ratio_val = (self.d_loss.detach().abs() / batch_size) / main_loss_logged_scale
                     self.loss += self.d_loss
-                    # Track running average of distillation loss
-                    d_loss_val = self.d_loss.detach()
+                    # Track running average of distillation loss (per-item scale for CSV logging)
+                    d_loss_logged = self.d_loss.detach() / batch_size
                     self.td_loss = (
-                        (self.td_loss * i + d_loss_val) / (i + 1) if self.td_loss is not None else d_loss_val
+                        (self.td_loss * i + d_loss_logged) / (i + 1) if self.td_loss is not None else d_loss_logged
                     )
                     self.td_ratio = (
                         (self.td_ratio * i + d_ratio_val) / (i + 1) if self.td_ratio is not None else d_ratio_val

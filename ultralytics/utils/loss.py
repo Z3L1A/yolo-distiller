@@ -241,6 +241,10 @@ class v8DetectionLoss:
             mask_gt,
         )
 
+        # Save fg_mask and per-level anchor counts for GT-guided distillation
+        self.last_fg_mask = fg_mask.detach()  # (bs, total_anchors) bool
+        self.last_anchor_splits = [f.shape[2] * f.shape[3] for f in feats]  # [H1*W1, H2*W2, H3*W3]
+
         target_scores_sum = max(target_scores.sum(), 1)
 
         # Cls loss
