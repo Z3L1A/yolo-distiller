@@ -87,7 +87,7 @@ workspace: 4 # (int) TensorRT: workspace size (GB)
 nms: False # (bool) CoreML: add NMS
 
 teacher: None
-distillation_loss: None # (str) distillation loss type: 'cwd' (feature-level), 'mgd' (feature-level), 'logit' (head-level)
+distillation_loss: None # (str) distillation loss type: 'cwd' (feature-level), 'mgd' (feature-level), 'fgd' (feature-level), 'logit' (head-level)
 distill_weight: 1.0 # (float) distillation loss weight multiplier
 distill_warmup_epochs: 3 # (int) epochs to gradually ramp up distillation loss after main warmup
 

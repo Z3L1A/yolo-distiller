@@ -149,6 +149,207 @@ class MGDLoss(nn.Module):
         return dis_loss
 
 
+class FGDLoss(nn.Module):
+    """PyTorch version of `Focal and Global Knowledge Distillation for Detectors`
+    <https://arxiv.org/abs/2111.11837> (CVPR 2022).
+
+    Combines focal distillation (foreground/background-aware feature matching weighted
+    by teacher attention) with global distillation (GcBlock-based relation transfer).
+
+    Four sub-losses:
+        - fg_loss:   MSE on foreground features weighted by teacher spatial+channel attention
+        - bg_loss:   MSE on background features weighted by teacher spatial+channel attention
+        - mask_loss: L1 between student/teacher spatial and channel attention maps
+        - rela_loss: GcBlock spatial-pooling relation loss (MSE)
+    """
+
+    def __init__(self, channels_t, temp=0.5, alpha_fgd=0.001, beta_fgd=0.0005,
+                 gamma_fgd=0.001, lambda_fgd=0.000005):
+        super(FGDLoss, self).__init__()
+        self.temp = temp
+        self.alpha_fgd = alpha_fgd
+        self.beta_fgd = beta_fgd
+        self.gamma_fgd = gamma_fgd
+        self.lambda_fgd = lambda_fgd
+
+        # Per-level learnable modules for spatial pooling (relation loss)
+        self.conv_mask_s = nn.ModuleList()
+        self.conv_mask_t = nn.ModuleList()
+        self.channel_add_conv_s = nn.ModuleList()
+        self.channel_add_conv_t = nn.ModuleList()
+
+        for ch in channels_t:
+            self.conv_mask_s.append(nn.Conv2d(ch, 1, kernel_size=1))
+            self.conv_mask_t.append(nn.Conv2d(ch, 1, kernel_size=1))
+            self.channel_add_conv_s.append(nn.Sequential(
+                nn.Conv2d(ch, ch // 2, kernel_size=1),
+                nn.LayerNorm([ch // 2, 1, 1]),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(ch // 2, ch, kernel_size=1),
+            ))
+            self.channel_add_conv_t.append(nn.Sequential(
+                nn.Conv2d(ch, ch // 2, kernel_size=1),
+                nn.LayerNorm([ch // 2, 1, 1]),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(ch // 2, ch, kernel_size=1),
+            ))
+
+        self.reset_parameters()
+
+    def forward(self, y_s, y_t, gt_bboxes=None, img_shape=None):
+        """Forward computation.
+        Args:
+            y_s (list): Student feature maps, each (N, C, H, W).
+            y_t (list): Teacher feature maps, each (N, C, H, W).
+            gt_bboxes (list[Tensor]): Per-image GT boxes in pixel xyxy, len=N.
+            img_shape (tuple): (H, W) of the input image.
+        """
+        assert len(y_s) == len(y_t)
+        losses = []
+
+        for idx, (s, t) in enumerate(zip(y_s, y_t)):
+            assert s.shape == t.shape
+            N, C, H, W = s.shape
+
+            S_attention_t, C_attention_t = self.get_attention(t, self.temp)
+            S_attention_s, C_attention_s = self.get_attention(s, self.temp)
+
+            # Build foreground/background masks from GT bboxes
+            Mask_fg = torch.zeros(N, H, W, device=s.device, dtype=s.dtype)
+            Mask_bg = torch.ones(N, H, W, device=s.device, dtype=s.dtype)
+
+            if gt_bboxes is not None and img_shape is not None:
+                img_h, img_w = img_shape
+                for i in range(N):
+                    if gt_bboxes[i].numel() == 0:
+                        continue
+                    bboxes = gt_bboxes[i]  # (nt, 4) in pixel xyxy
+                    # Scale bboxes to feature map resolution
+                    wmin = torch.floor(bboxes[:, 0] / img_w * W).int().clamp(0, W - 1)
+                    wmax = torch.ceil(bboxes[:, 2] / img_w * W).int().clamp(0, W - 1)
+                    hmin = torch.floor(bboxes[:, 1] / img_h * H).int().clamp(0, H - 1)
+                    hmax = torch.ceil(bboxes[:, 3] / img_h * H).int().clamp(0, H - 1)
+
+                    # Inverse-area weighting per GT box
+                    area = 1.0 / ((hmax - hmin + 1).float() * (wmax - wmin + 1).float())
+                    for j in range(len(bboxes)):
+                        Mask_fg[i, hmin[j]:hmax[j]+1, wmin[j]:wmax[j]+1] = torch.maximum(
+                            Mask_fg[i, hmin[j]:hmax[j]+1, wmin[j]:wmax[j]+1], area[j]
+                        )
+
+                    Mask_bg[i] = torch.where(Mask_fg[i] > 0, torch.tensor(0.0, device=s.device), torch.tensor(1.0, device=s.device))
+                    if Mask_bg[i].sum() > 0:
+                        Mask_bg[i] /= Mask_bg[i].sum()
+
+            fg_loss, bg_loss = self.get_fea_loss(s, t, Mask_fg, Mask_bg,
+                                                  C_attention_s, C_attention_t,
+                                                  S_attention_s, S_attention_t)
+            mask_loss = self.get_mask_loss(C_attention_s, C_attention_t,
+                                           S_attention_s, S_attention_t)
+            rela_loss = self.get_rela_loss(s, t, idx)
+
+            loss = (self.alpha_fgd * fg_loss + self.beta_fgd * bg_loss
+                    + self.gamma_fgd * mask_loss + self.lambda_fgd * rela_loss)
+            losses.append(loss)
+
+        return sum(losses)
+
+    def get_attention(self, preds, temp):
+        """Compute spatial and channel attention maps.
+        Args:
+            preds: (N, C, H, W) feature tensor.
+            temp: Temperature for softmax.
+        Returns:
+            S_attention: (N, H, W) spatial attention.
+            C_attention: (N, C) channel attention.
+        """
+        N, C, H, W = preds.shape
+        value = torch.abs(preds)
+
+        # Spatial attention: mean over channels → softmax over spatial
+        fea_map = value.mean(dim=1, keepdim=True)  # (N, 1, H, W)
+        S_attention = (H * W * F.softmax((fea_map / temp).view(N, -1), dim=1)).view(N, H, W)
+
+        # Channel attention: mean over spatial → softmax over channels
+        channel_map = value.mean(dim=2).mean(dim=2)  # (N, C)
+        C_attention = C * F.softmax(channel_map / temp, dim=1)
+
+        return S_attention, C_attention
+
+    def get_fea_loss(self, preds_S, preds_T, Mask_fg, Mask_bg,
+                     C_s, C_t, S_s, S_t):
+        """Compute foreground and background feature losses."""
+        loss_mse = nn.MSELoss(reduction='sum')
+
+        Mask_fg = Mask_fg.unsqueeze(dim=1)  # (N, 1, H, W)
+        Mask_bg = Mask_bg.unsqueeze(dim=1)
+
+        C_t = C_t.unsqueeze(-1).unsqueeze(-1)  # (N, C, 1, 1)
+        S_t = S_t.unsqueeze(dim=1)  # (N, 1, H, W)
+
+        # Weight features by teacher attention
+        fea_t = torch.mul(preds_T, torch.sqrt(S_t))
+        fea_t = torch.mul(fea_t, torch.sqrt(C_t))
+        fg_fea_t = torch.mul(fea_t, torch.sqrt(Mask_fg))
+        bg_fea_t = torch.mul(fea_t, torch.sqrt(Mask_bg))
+
+        fea_s = torch.mul(preds_S, torch.sqrt(S_t))
+        fea_s = torch.mul(fea_s, torch.sqrt(C_t))
+        fg_fea_s = torch.mul(fea_s, torch.sqrt(Mask_fg))
+        bg_fea_s = torch.mul(fea_s, torch.sqrt(Mask_bg))
+
+        fg_loss = loss_mse(fg_fea_s, fg_fea_t) / len(Mask_fg)
+        bg_loss = loss_mse(bg_fea_s, bg_fea_t) / len(Mask_bg)
+
+        return fg_loss, bg_loss
+
+    def get_mask_loss(self, C_s, C_t, S_s, S_t):
+        """L1 loss between student/teacher attention maps."""
+        mask_loss = (torch.sum(torch.abs(C_s - C_t)) / len(C_s)
+                     + torch.sum(torch.abs(S_s - S_t)) / len(S_s))
+        return mask_loss
+
+    def spatial_pool(self, x, idx, in_type):
+        """GcBlock-style spatial pooling for relation loss."""
+        batch, channel, height, width = x.size()
+        input_x = x.view(batch, channel, height * width).unsqueeze(1)  # (N, 1, C, H*W)
+
+        if in_type == 0:
+            context_mask = self.conv_mask_s[idx](x)
+        else:
+            context_mask = self.conv_mask_t[idx](x)
+
+        context_mask = context_mask.view(batch, 1, height * width)  # (N, 1, H*W)
+        context_mask = F.softmax(context_mask, dim=2).unsqueeze(-1)  # (N, 1, H*W, 1)
+        context = torch.matmul(input_x, context_mask).view(batch, channel, 1, 1)  # (N, C, 1, 1)
+        return context
+
+    def get_rela_loss(self, preds_S, preds_T, idx):
+        """GcBlock relation loss between student and teacher features."""
+        loss_mse = nn.MSELoss(reduction='sum')
+
+        context_s = self.spatial_pool(preds_S, idx, 0)
+        context_t = self.spatial_pool(preds_T, idx, 1)
+
+        out_s = preds_S + self.channel_add_conv_s[idx](context_s)
+        out_t = preds_T + self.channel_add_conv_t[idx](context_t)
+
+        rela_loss = loss_mse(out_s, out_t) / len(out_s)
+        return rela_loss
+
+    def reset_parameters(self):
+        for i in range(len(self.conv_mask_s)):
+            nn.init.kaiming_normal_(self.conv_mask_s[i].weight, mode='fan_in')
+            nn.init.kaiming_normal_(self.conv_mask_t[i].weight, mode='fan_in')
+            # Zero-init last layer of channel_add convs
+            if isinstance(self.channel_add_conv_s[i], nn.Sequential):
+                nn.init.constant_(self.channel_add_conv_s[i][-1].weight, 0)
+                nn.init.constant_(self.channel_add_conv_s[i][-1].bias, 0)
+            if isinstance(self.channel_add_conv_t[i], nn.Sequential):
+                nn.init.constant_(self.channel_add_conv_t[i][-1].weight, 0)
+                nn.init.constant_(self.channel_add_conv_t[i][-1].bias, 0)
+
+
 class FeatureLoss(nn.Module):
     def __init__(self, channels_s, channels_t, distiller='mgd', loss_weight=1.0):
         super(FeatureLoss, self).__init__()
@@ -164,15 +365,19 @@ class FeatureLoss(nn.Module):
             )
             self.align_module.append(align)
 
+        self.needs_gt = (distiller == 'fgd')
+
         if distiller == 'mgd':
             # After alignment, student features have teacher_channels dims
             self.feature_loss = MGDLoss(channels_t, channels_t)
         elif distiller == 'cwd':
             self.feature_loss = CWDLoss(channels_t, channels_t)
+        elif distiller == 'fgd':
+            self.feature_loss = FGDLoss(channels_t)
         else:
             raise NotImplementedError
 
-    def forward(self, y_s, y_t):
+    def forward(self, y_s, y_t, gt_bboxes=None, img_shape=None):
         if len(y_s) != len(y_t):
             y_t = y_t[len(y_t) // 2:]
 
@@ -189,7 +394,10 @@ class FeatureLoss(nn.Module):
             stu_feats.append(s)
             tea_feats.append(t.detach())
 
-        loss = self.feature_loss(stu_feats, tea_feats)
+        if self.needs_gt:
+            loss = self.feature_loss(stu_feats, tea_feats, gt_bboxes=gt_bboxes, img_shape=img_shape)
+        else:
+            loss = self.feature_loss(stu_feats, tea_feats)
         return self.loss_weight * loss
 
 
@@ -289,15 +497,43 @@ class DistillationLoss:
             self.remove_handle.append(ml.register_forward_hook(make_teacher_hook(self.teacher_outputs)))
             self.remove_handle.append(ori.register_forward_hook(make_student_hook(self.student_outputs)))
 
-    def get_loss(self):
+    def get_loss(self, batch=None):
         if not self.teacher_outputs or not self.student_outputs:
             return torch.tensor(0.0, requires_grad=True)
         
         if len(self.teacher_outputs) != len(self.student_outputs):
             print(f"Warning: Mismatched outputs - Teacher: {len(self.teacher_outputs)}, Student: {len(self.student_outputs)}")
             return torch.tensor(0.0, requires_grad=True)
-        
-        quant_loss = self.distill_loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs)
+
+        # Extract GT bboxes for FGD (ignored by CWD/MGD)
+        gt_bboxes = None
+        img_shape = None
+        if batch is not None and self.distill_loss_fn.needs_gt:
+            from ultralytics.utils.ops import xywh2xyxy
+            img_h, img_w = batch['img'].shape[2:]
+            img_shape = (img_h, img_w)
+            batch_idx = batch['batch_idx']  # (M,)
+            bboxes_xywh = batch['bboxes']   # (M, 4) normalized xywh
+            # Convert to pixel xyxy
+            bboxes_xyxy = xywh2xyxy(bboxes_xywh)
+            bboxes_xyxy[:, [0, 2]] *= img_w
+            bboxes_xyxy[:, [1, 3]] *= img_h
+            # Split per image
+            bs = batch['img'].shape[0]
+            gt_bboxes = []
+            for i in range(bs):
+                mask = batch_idx == i
+                gt_bboxes.append(bboxes_xyxy[mask])
+
+        if gt_bboxes is not None:
+            quant_loss = self.distill_loss_fn(
+                y_s=self.student_outputs, y_t=self.teacher_outputs,
+                gt_bboxes=gt_bboxes, img_shape=img_shape
+            )
+        else:
+            quant_loss = self.distill_loss_fn(
+                y_s=self.student_outputs, y_t=self.teacher_outputs
+            )
 
         self.teacher_outputs.clear()
         self.student_outputs.clear()
@@ -391,7 +627,7 @@ class LogitDistillationLoss:
             self.teacher_detect.register_forward_hook(make_teacher_hook(self.teacher_outputs))
         )
 
-    def get_loss(self):
+    def get_loss(self, batch=None):
         """Compute GT-guided logit distillation loss from captured head outputs.
 
         Uses fg_mask from TAL assignment to distill ONLY on foreground (positive)
@@ -807,6 +1043,7 @@ class BaseTrainer:
                 LOGGER.info("Using logit-level knowledge distillation (tau=2.0, objectness-weighted)")
             else:
                 distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
+                LOGGER.info(f"Using {self.loss_type}-level feature distillation")
                 # Move FeatureLoss (align_module, etc.) to training device
                 distillation_loss.distill_loss_fn = distillation_loss.distill_loss_fn.to(self.device)
                 # Add FeatureLoss learnable params (align_module) to optimizer
@@ -893,7 +1130,7 @@ class BaseTrainer:
                     with torch.no_grad():
                         pred = self.teacher(batch['img'])
                         
-                    self.d_loss = distillation_loss.get_loss()
+                    self.d_loss = distillation_loss.get_loss(batch=batch)
                     # Gradual distill warmup over distill_warmup_iters after main warmup ends
                     distill_warmup_iters = nb * self.args.distill_warmup_epochs
                     if distill_warmup_iters > 0:
@@ -921,7 +1158,7 @@ class BaseTrainer:
                     # During warmup: run teacher forward to fill hooks, but discard loss
                     with torch.no_grad():
                         pred = self.teacher(batch['img'])
-                    distillation_loss.get_loss()  # clear hook buffers
+                    distillation_loss.get_loss(batch=batch)  # clear hook buffers
 
                 # Backward
                 self.scaler.scale(self.loss).backward()
