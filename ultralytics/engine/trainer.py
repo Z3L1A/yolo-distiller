@@ -278,8 +278,14 @@ class FGDLoss(nn.Module):
 
     def get_fea_loss(self, preds_S, preds_T, Mask_fg, Mask_bg,
                      C_s, C_t, S_s, S_t):
-        """Compute foreground and background feature losses."""
+        """Compute foreground and background feature losses.
+
+        Normalized by N*C to keep spatial summation (important for
+        foreground/background weighting) while being robust to different
+        feature map resolutions across architecture variants.
+        """
         loss_mse = nn.MSELoss(reduction='sum')
+        N, C, H, W = preds_S.shape
 
         Mask_fg = Mask_fg.unsqueeze(dim=1)  # (N, 1, H, W)
         Mask_bg = Mask_bg.unsqueeze(dim=1)
@@ -298,15 +304,15 @@ class FGDLoss(nn.Module):
         fg_fea_s = torch.mul(fea_s, torch.sqrt(Mask_fg))
         bg_fea_s = torch.mul(fea_s, torch.sqrt(Mask_bg))
 
-        fg_loss = loss_mse(fg_fea_s, fg_fea_t) / len(Mask_fg)
-        bg_loss = loss_mse(bg_fea_s, bg_fea_t) / len(Mask_bg)
+        fg_loss = loss_mse(fg_fea_s, fg_fea_t) / (N * C)
+        bg_loss = loss_mse(bg_fea_s, bg_fea_t) / (N * C)
 
         return fg_loss, bg_loss
 
     def get_mask_loss(self, C_s, C_t, S_s, S_t):
         """L1 loss between student/teacher attention maps."""
-        mask_loss = (torch.sum(torch.abs(C_s - C_t)) / len(C_s)
-                     + torch.sum(torch.abs(S_s - S_t)) / len(S_s))
+        mask_loss = (torch.sum(torch.abs(C_s - C_t)) / C_s.numel()
+                     + torch.sum(torch.abs(S_s - S_t)) / S_s.numel())
         return mask_loss
 
     def spatial_pool(self, x, idx, in_type):
@@ -327,6 +333,7 @@ class FGDLoss(nn.Module):
     def get_rela_loss(self, preds_S, preds_T, idx):
         """GcBlock relation loss between student and teacher features."""
         loss_mse = nn.MSELoss(reduction='sum')
+        N, C, H, W = preds_S.shape
 
         context_s = self.spatial_pool(preds_S, idx, 0)
         context_t = self.spatial_pool(preds_T, idx, 1)
@@ -334,7 +341,7 @@ class FGDLoss(nn.Module):
         out_s = preds_S + self.channel_add_conv_s[idx](context_s)
         out_t = preds_T + self.channel_add_conv_t[idx](context_t)
 
-        rela_loss = loss_mse(out_s, out_t) / len(out_s)
+        rela_loss = loss_mse(out_s, out_t) / (N * C)
         return rela_loss
 
     def reset_parameters(self):
