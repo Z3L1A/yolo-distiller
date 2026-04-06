@@ -366,10 +366,14 @@ class FeatureLoss(nn.Module):
         # Channel alignment: student → teacher dims (no .to(device) — inherits from parent)
         self.align_module = nn.ModuleList()
         for s_chan, t_chan in zip(channels_s, channels_t):
-            align = nn.Sequential(
-                nn.Conv2d(s_chan, t_chan, kernel_size=1, stride=1, padding=0),
-                nn.BatchNorm2d(t_chan, affine=False)
-            )
+            if distiller == 'fgd':
+                # FGD requires raw feature scale for attention-weighted matching — no BN
+                align = nn.Conv2d(s_chan, t_chan, kernel_size=1, stride=1, padding=0)
+            else:
+                align = nn.Sequential(
+                    nn.Conv2d(s_chan, t_chan, kernel_size=1, stride=1, padding=0),
+                    nn.BatchNorm2d(t_chan, affine=False)
+                )
             self.align_module.append(align)
 
         self.needs_gt = (distiller == 'fgd')
